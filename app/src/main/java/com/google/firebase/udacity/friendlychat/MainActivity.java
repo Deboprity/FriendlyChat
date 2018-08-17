@@ -37,8 +37,11 @@ import android.widget.ProgressBar;
 import android.widget.Toast;
 
 import com.firebase.ui.auth.AuthUI;
+import com.google.android.gms.tasks.Continuation;
+import com.google.android.gms.tasks.OnCompleteListener;
 import com.google.android.gms.tasks.OnFailureListener;
 import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.android.gms.tasks.Task;
 import com.google.firebase.auth.EmailAuthProvider;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
@@ -193,9 +196,15 @@ public class MainActivity extends AppCompatActivity {
             }
         };
 
+        // Create Remote Config Setting to enable developer mode.
+        // Fetching configs from the server is normally limited to 5 requests per hour.
+        // Enabling developer mode allows many more requests to be made per hour, so developers
+        // can test different config values during development.
         FirebaseRemoteConfigSettings configSettings = new FirebaseRemoteConfigSettings.Builder().setDeveloperModeEnabled(BuildConfig.DEBUG).build();
         mFirebaseRemoteConfig.setConfigSettings(configSettings);
 
+        // Define default config values. Defaults are used when fetched config values are not
+        // available. Eg: if an error occurred fetching values from the server.
         Map<String, Object> defaultConfigMap = new HashMap<>();
         defaultConfigMap.put(FRIENDLY_MSG_LENGTH_KEY, DEFAULT_MSG_LENGTH_LIMIT);
         mFirebaseRemoteConfig.setDefaults(defaultConfigMap);
@@ -205,35 +214,61 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    public void onActivityResult(int requestCode, int resultCode, Intent data) {
 
         Log.d(TAG, "onActivityResult: started");
         super.onActivityResult(requestCode, resultCode, data);
         if(requestCode == RC_SIGN_IN){
             if(resultCode == RESULT_OK){
+                // Sign-in succeeded, set up the UI
                 Toast.makeText(this, "Signed in!", Toast.LENGTH_SHORT).show();
             }else if (resultCode == RESULT_CANCELED){
+                // Sign in was canceled by the user, finish the activity
                 Toast.makeText(this, "Sign in Cancelled", Toast.LENGTH_SHORT).show();
                 finish();
-            }else if(requestCode == RC_PHOTO_PICKER && resultCode == RESULT_OK){
-                Uri selectedImageUri = data.getData();
-
-                // Get a reference to store file at chat_photos/<FILE_NAME>
-                StorageReference photoRef = mChatPhotosStorageReference.child(selectedImageUri.getLastPathSegment());
-
-                // Upload file to Firebase Storage
-                photoRef.putFile(selectedImageUri).addOnSuccessListener(this, new OnSuccessListener<UploadTask.TaskSnapshot>() {
-                    @Override
-                    public void onSuccess(UploadTask.TaskSnapshot taskSnapshot) {
-                        //Uri downloadUrl = taskSnapshot.getUploadSessionUri();
-                        String downloadUrl = taskSnapshot.getMetadata().getReference().getDownloadUrl().toString();
-                        //Uri downloadUrl = taskSnapshot.getStorage().getDownloadUrl();
-                        //Uri downloadUrl;
-                        FriendlyMessage friendlyMessage = new FriendlyMessage(null, mUsername, downloadUrl);
-                        mMessagesDatabaseReference.push().setValue(friendlyMessage);
-                    }
-                });
             }
+        }else if(requestCode == RC_PHOTO_PICKER && resultCode == RESULT_OK){
+            Uri selectedImageUri = data.getData();
+
+            // Get a reference to store file at chat_photos/<FILE_NAME>
+            final StorageReference photoRef = mChatPhotosStorageReference.child(selectedImageUri.getLastPathSegment());
+
+            Log.d(TAG, "onActivityResult: selectedImageUri.getPath() :: "+selectedImageUri.getPath());
+            Log.d(TAG, "onActivityResult: photoRef.getPath() :: "+photoRef.getPath());
+
+            // Upload file to Firebase Storage
+//            photoRef.putFile(selectedImageUri).addOnSuccessListener(this, new OnSuccessListener<UploadTask.TaskSnapshot>() {
+//                public void onSuccess(UploadTask.TaskSnapshot taskSnapshot) {
+//                    //String downloadUrl = taskSnapshot.getMetadata().getReference().getDownloadUrl().toString();
+//                    //String downloadUrl = taskSnapshot.getStorage().getDownloadUrl().toString();
+//                    String downloadUrl = taskSnapshot.getUploadSessionUri().getPath();
+//                    Log.d(TAG, "onSuccess: downloadUrl :: "+downloadUrl);
+//                    // Set the download URL to the message box, so that the user can send it to the database
+//                    FriendlyMessage friendlyMessage = new FriendlyMessage(null, mUsername, downloadUrl);
+//                    mMessagesDatabaseReference.push().setValue(friendlyMessage);
+//                }
+//            });
+            photoRef.putFile(selectedImageUri).continueWithTask(new Continuation<UploadTask.TaskSnapshot, Task<Uri>>() {
+                @Override
+                public Task<Uri> then(@NonNull Task<UploadTask.TaskSnapshot> task) throws Exception {
+                    if (!task.isSuccessful()) {
+                        throw task.getException();
+                    }
+                    return photoRef.getDownloadUrl();
+                }
+            }).addOnCompleteListener(new OnCompleteListener<Uri>() {
+                @Override
+                public void onComplete(@NonNull Task<Uri> task) {
+                    if (task.isSuccessful()) {
+                        Uri downloadUri = task.getResult();
+                        Log.d(TAG, "onComplete: downloadUri :: "+downloadUri.toString());
+                        FriendlyMessage friendlyMessage = new FriendlyMessage(null, mUsername, downloadUri.toString());
+                        mMessagesDatabaseReference.push().setValue(friendlyMessage);
+                    } else {
+                        Toast.makeText(MainActivity.this, "upload failed: " + task.getException().getMessage(), Toast.LENGTH_SHORT).show();
+                    }
+                }
+            });
         }
         Log.d(TAG, "onActivityResult: ended");
     }
@@ -287,6 +322,7 @@ public class MainActivity extends AppCompatActivity {
         Log.d(TAG, "onSignedOutCleanup: started");
         mUsername = ANONYMOUS;
         mMessageAdapter.clear();
+        detachDatabaseReadListener();
     }
 
     private void attachDatabaseReadListener(){
@@ -315,6 +351,7 @@ public class MainActivity extends AppCompatActivity {
                 public void onCancelled(@NonNull DatabaseError databaseError) {
                 }
             };
+            mMessagesDatabaseReference.addChildEventListener(mChildEventListener);
         }
         mMessagesDatabaseReference.addChildEventListener(mChildEventListener);
     }
@@ -327,6 +364,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // Fetch the config to determine the allowed length of messages.
     public void fetchConfig(){
         Log.d(TAG, "fetchConfig: started");
         long cacheExpiration = 3600;
@@ -350,6 +388,10 @@ public class MainActivity extends AppCompatActivity {
                 });
     }
 
+    /**
+     * Apply retrieved length limit to edit text field. This result may be fresh from the server or it may be from
+     * cached values.
+     */
     private void applyRetrievedLengthLimit(){
         Log.d(TAG, "applyRetrievedLengthLimit: started");
         Long friendly_msg_length = mFirebaseRemoteConfig.getLong(FRIENDLY_MSG_LENGTH_KEY);
